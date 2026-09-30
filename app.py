@@ -28,7 +28,7 @@ TR = {
     "cal:ampm": ("午前/午後", "AM/PM"),
     "cal:season": ("季節", "Season"),
     "cal:month": ("月", "Month"),
-    "engine_xreg": ("TimesFM XReg（JAX必須）", "TimesFM XReg (requires JAX)"),
+    "engine_xreg": ("TimesFM XReg（JAX・scikit-learn必須）", "TimesFM XReg (requires JAX and scikit-learn)"),
     "engine_ridge": ("Ridge回帰＋TimesFM（JAX不要）", "Ridge regression + TimesFM (no JAX)"),
     "fill_last": ("最後の値で埋める", "Fill with the last value"),
     "fill_forecast": ("TimesFMで予測して埋める", "Forecast with TimesFM and fill"),
@@ -83,8 +83,12 @@ TR = {
     "engine": ("共変量の方式", "Covariate method"),
     "engine_help": ("Ridge回帰＋TimesFM: 説明変数の効果を回帰で取り除いた残差をTimesFMで予測し、効果を足し戻します。",
                     "Ridge regression + TimesFM: removes the covariates' effect by regression, forecasts the residual with TimesFM, then adds the effect back."),
-    "jax_caption": ("※ JAXを読み込めないため、初期値をJAX不要の方式にしています。",
-                    "Note: JAX could not be loaded, so the default is the method that does not need JAX."),
+    "jax_caption": ("※ JAX または scikit-learn を読み込めないため、初期値をJAX不要の方式にしています（XReg方式を選んでも、自動でRidge方式に切り替えます）。",
+                    "Note: JAX or scikit-learn could not be loaded, so the default is the method that does not need them (choosing XReg falls back to Ridge automatically)."),
+    "xreg_fallback": ("XReg方式に必要な JAX / scikit-learn を読み込めないため、Ridge回帰＋TimesFM方式で予測します。"
+                      "XReg方式を使うには、仮想環境で `pip install jax scikit-learn` を実行してください。",
+                      "JAX / scikit-learn (needed for the XReg method) could not be loaded, so the Ridge regression + TimesFM method is used. "
+                      "To use XReg, run `pip install jax scikit-learn` in the virtual environment."),
     "xmode": ("xreg_mode（XReg方式のみ）", "xreg_mode (XReg method only)"),
     "ridge": ("ridge（正則化）", "ridge (regularization)"),
     "pick_target": ("予測するデータ項目を1つ以上選択してください。", "Please select at least one column to forecast."),
@@ -372,6 +376,7 @@ ss = st.session_state
 
 try:
     import jax  # noqa: F401
+    from sklearn import preprocessing  # noqa: F401  (TimesFMのXRegが必要とする)
 
     jax_ok = True
 except Exception:  # noqa: BLE001
@@ -523,10 +528,13 @@ if st.button(t("start"), type="primary"):
     cont = bool(from_val and v > 0)  # 検証区間の開始点から (検証+予測) を1回で予測
     mh = math.ceil((v + h if cont else max(v, h)) / 128) * 128
     use_cov = bool(csv_covs or cal_opts)
+    eff_xreg = use_xreg and jax_ok
+    if use_cov and use_xreg and not jax_ok:
+        st.warning(t("xreg_fallback"))
     try:
         fut_idx = future_index(d[tcol], h)
         with st.spinner(t("model_loading")):
-            model = get_model(int(max_context), mh, normalize, qhead, flip, positive, fixq, use_cov and use_xreg)
+            model = get_model(int(max_context), mh, normalize, qhead, flip, positive, fixq, use_cov and eff_xreg)
         timeline = pd.DatetimeIndex(list(d[tcol]) + list(fut_idx))
         cov_num, cov_cat = {}, {}
         for c in csv_covs:
@@ -535,7 +543,8 @@ if st.button(t("start"), type="primary"):
                 s = to_num(full).interpolate(limit_direction="both").reset_index(drop=True)
                 if fill_mode == "forecast" and len(s) < n + h:
                     ctx = s.to_numpy(dtype=float)[-int(max_context) :]
-                    pf = model.forecast(horizon=n + h - len(s), inputs=[ctx])[0][0]
+                    miss = n + h - len(s)
+                    pf = np.asarray(model.forecast(horizon=miss, inputs=[ctx])[0][0])[-miss:]  # backcast付きの場合に備え末尾のみ
                     s = pd.concat([s, pd.Series(pf)], ignore_index=True)
                 s = s.reindex(range(n + h)).ffill()
                 cov_num[c] = s.to_numpy(dtype=float)
@@ -550,7 +559,7 @@ if st.button(t("start"), type="primary"):
             st.info(t("dropped", names=", ".join(t(k) for k in dropped)))
         with st.spinner(t("predicting")):
             arrs = [d[c].to_numpy(dtype=float) for c in targets]
-            args = (cov_num, cov_cat, max_context, xmode, ridge, use_xreg)
+            args = (cov_num, cov_cat, max_context, xmode, ridge, eff_xreg)
             if cont:
                 all_p, all_q = run_forecast(model, arrs, n - v, v + h, *args)
                 val_pred, fut_pred = all_p[:, :v], all_p[:, v:]

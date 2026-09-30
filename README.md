@@ -27,7 +27,7 @@ The UI is built with Streamlit, so you can go from loading a CSV to forecasting 
 1. Put the folder anywhere you like (outside `Downloads` is recommended; see Troubleshooting below).
 2. Double-click `setup.bat`.
    - It creates `venv` and installs the contents of `requirements.txt`.
-   - It then installs `timesfm[xreg]` (which uses JAX) for covariates as a separate step. If this fails you only get a warning; forecasting without covariates and the Ridge covariate method still work.
+   - It then installs `jax` and `scikit-learn` for the XReg covariate method as a separate step. If this fails you only get a warning; forecasting without covariates and the Ridge covariate method still work.
 3. Double-click `run.bat`. The app opens in your browser.
 
 ## How to use
@@ -91,10 +91,10 @@ Using a CSV column as a covariate requires its values for the forecast period.
 
 | Method | Description |
 | --- | --- |
-| TimesFM XReg (requires JAX) | TimesFM's built-in covariate feature. `xreg_mode` and `ridge` can be set. |
+| TimesFM XReg (requires JAX and scikit-learn) | TimesFM's built-in covariate feature. `xreg_mode` and `ridge` can be set. |
 | Ridge regression + TimesFM (no JAX) | Removes the effect of the covariates with Ridge regression, forecasts the residual with TimesFM, then adds the effect back. Handles linear relationships only. |
 
-In environments where JAX cannot be loaded, the default switches to the Ridge method automatically.
+In environments where JAX or scikit-learn cannot be loaded, the default switches to the Ridge method automatically.
 
 Validation uses the actual CSV values for the covariates, so the validation results show accuracy when the covariates are known correctly.
 
@@ -121,12 +121,12 @@ Windows application control (Smart App Control / WDAC / AppLocker) is blocking a
 
 ### `Failed to load the XReg module`
 
-JAX could not be loaded. Switch the covariate method to "Ridge regression + TimesFM (no JAX)", or investigate the cause:
+JAX or scikit-learn could not be loaded. Even if you choose the XReg method, the app falls back to the Ridge method automatically (a warning is shown). To use XReg, run:
 
 ```
 venv\Scripts\activate
-pip install "timesfm[xreg]"
-python -c "import jax"
+pip install jax scikit-learn
+python -c "import jax, sklearn"
 ```
 
 ### Cannot select columns to forecast

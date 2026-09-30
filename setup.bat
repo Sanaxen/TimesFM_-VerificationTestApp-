@@ -36,7 +36,7 @@ if errorlevel 1 (
 
 echo.
 echo Installing covariate (XReg) support...
-pip install "timesfm[xreg]"
+pip install jax scikit-learn
 if errorlevel 1 (
   echo [WARN] XReg install failed. Covariates will be unavailable; the rest still works.
 )

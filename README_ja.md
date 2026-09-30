@@ -27,7 +27,7 @@ UI は Streamlit で、ブラウザ上で CSV の読み込みから予測、グ�
 1. フォルダ一式を任意の場所に置きます（`Downloads` 以外を推奨。後述のトラブルシューティング参照）。
 2. `setup.bat` をダブルクリックします。
    - `venv` を作成し、`requirements.txt` の内容をインストールします。
-   - 続けて、共変量用の `timesfm[xreg]`（JAX を使用）を別枠でインストールします。失敗しても警告が出るだけで、共変量なしの予測や Ridge 方式の共変量は使えます。
+   - 続けて、共変量の XReg 方式用に `jax` と `scikit-learn` を別枠でインストールします。失敗しても警告が出るだけで、共変量なしの予測や Ridge 方式の共変量は使えます。
 3. `run.bat` をダブルクリックすると、ブラウザでアプリが開きます。
 
 ## 使い方
@@ -91,10 +91,10 @@ CSV の列を使うには、予測期間の値が必要です。
 
 | 方式 | 内容 |
 | --- | --- |
-| TimesFM XReg（JAX 必須） | TimesFM 標準の共変量機能。`xreg_mode` と `ridge` を指定できます。 |
+| TimesFM XReg（JAX・scikit-learn 必須） | TimesFM 標準の共変量機能。`xreg_mode` と `ridge` を指定できます。 |
 | Ridge 回帰＋TimesFM（JAX 不要） | 説明変数の効果を Ridge 回帰で取り除いた残差を TimesFM で予測し、効果を足し戻します。線形の関係のみ扱えます。 |
 
-JAX を読み込めない環境では、初期値が自動で Ridge 方式になります。
+JAX または scikit-learn を読み込めない環境では、初期値が自動で Ridge 方式になります。
 
 検証期間の説明変数には CSV の実際の値を使うため、検証結果は「説明変数が正しく分かっている場合」の精度です。
 
@@ -121,12 +121,12 @@ Windows のアプリケーション制御（Smart App Control / WDAC / AppLocker
 
 ### `Failed to load the XReg module`
 
-JAX が読み込めていません。共変量の方式を「Ridge 回帰＋TimesFM（JAX 不要）」に切り替えるか、原因を調べます。
+JAX または scikit-learn が読み込めていません。XReg 方式を選んでも、読み込めない場合は自動で Ridge 方式に切り替わります（画面に警告が出ます）。XReg 方式を使うには、次を実行します。
 
 ```
 venv\Scripts\activate
-pip install "timesfm[xreg]"
-python -c "import jax"
+pip install jax scikit-learn
+python -c "import jax, sklearn"
 ```
 
 ### 予測する項目が選べない
