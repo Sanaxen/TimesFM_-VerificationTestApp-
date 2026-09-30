@@ -45,6 +45,13 @@ The UI is built with Streamlit, so you can go from loading a CSV to forecasting 
 
 These are two separate forecasts, so there can be a step between the end of the validation forecast and the last actual value. That step is the validation forecast error.
 
+**When "Start the forecast from the beginning of the validation period" is on**
+
+- Only the data before the validation period is used, and one forecast covers "validation period + horizon" starting at the beginning of the validation period.
+- The validation and future forecasts form a single continuous line, so the step described above does not appear.
+- However, the actual values in the validation period are not used for forecasting, so the most recent movement is not reflected.
+- Disabled when the validation period is 0%.
+
 ### Chart
 
 - Each forecast column is drawn in its own color. The validation period is shaded orange and the future forecast period green.

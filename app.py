@@ -54,6 +54,14 @@ TR = {
     "val_pct": ("検証期間（データ全体に対する後半の割合 %）", "Validation period (% of the data, taken from the end)"),
     "val_pct_help": ("0にすると検証を行わず、未来予測のみ実行します", "Set to 0 to skip validation and run only the future forecast"),
     "horizon": ("予測期間（データ末尾から先の行数）", "Forecast horizon (rows beyond the end of the data)"),
+    "from_val": ("検証区間の開始点から予測を開始する", "Start the forecast from the beginning of the validation period"),
+    "from_val_help": ("オンにすると、検証期間より前のデータだけを使い、検証期間の先頭から「検証期間＋予測期間」ぶんを1回で予測します。"
+                      "検証予測と未来予測が途切れずにつながりますが、検証期間の実測値は予測に使われません。検証期間が0%のときは無効です。",
+                      "When on, only the data before the validation period is used, and one forecast covers 'validation period + horizon' "
+                      "from the start of the validation period. The validation and future forecasts connect without a gap, but the actual "
+                      "values in the validation period are not used for forecasting. Disabled when the validation period is 0%."),
+    "cont_note": ("検証区間の開始点から、検証期間＋予測期間を1回で予測しています。",
+                  "One forecast covers the validation period plus the horizon, starting at the beginning of the validation period."),
     "params_exp": ("TimesFM 予測パラメータ（初期値はデフォルト）", "TimesFM parameters (defaults at startup)"),
     "max_context": ("max_context（参照する過去の最大長, 32の倍数）", "max_context (maximum history length, multiple of 32)"),
     "max_context_help": ("長いほど多くの履歴を使う。TimesFM 2.5は最大16k", "Longer values use more history. TimesFM 2.5 supports up to 16k"),
@@ -283,7 +291,8 @@ def make_fig(cols, targets, d, tcol, res, only_forecast, show_band):
             fig.add_trace(go.Scatter(x=xv, y=res["val_pred"][k], name=f"{c} ({t('val_fc')})",
                                      line=dict(color=color, dash="dot", width=2)))
         xf = [d[tcol].iloc[-1]] + list(res["fut_idx"])
-        yf = [d[c].iloc[-1]] + list(res["fut_pred"][k])
+        y0 = res["val_pred"][k][-1] if res.get("cont") else d[c].iloc[-1]
+        yf = [y0] + list(res["fut_pred"][k])
         if show_band and res["fut_q"] is not None:
             lo, hi = res["fut_q"][k][:, 1], res["fut_q"][k][:, 9]
             fig.add_trace(go.Scatter(x=list(res["fut_idx"]), y=hi, line=dict(width=0), showlegend=False, hoverinfo="skip"))
@@ -311,6 +320,7 @@ CAL_ALL = ["dow", "holiday", "ampm", "season", "month"]
 SPEC = {
     "val_pct": ("int", 20, (0, 50)),
     "horizon": ("int", 24, (1, 16000)),
+    "from_val": ("bool", False, None),
     "max_context": ("int", 1024, (32, 16384)),
     "normalize": ("bool", True, None),
     "qhead": ("bool", True, None),
@@ -445,6 +455,7 @@ targets = c2.multiselect(t("col_targets"), num_cols, key="targets")
 c3, c4 = st.columns(2)
 val_pct = c3.slider(t("val_pct"), 0, 50, key="val_pct", help=t("val_pct_help"))
 horizon = c4.number_input(t("horizon"), min_value=1, max_value=16000, step=1, key="horizon")
+from_val = st.checkbox(t("from_val"), key="from_val", help=t("from_val_help"), disabled=val_pct == 0)
 
 with st.expander(t("params_exp")):
     p1, p2 = st.columns(2)
@@ -509,7 +520,8 @@ if st.button(t("start"), type="primary"):
         st.error(t("val_too_long"))
         st.stop()
     h = int(horizon)
-    mh = math.ceil(max(v, h) / 128) * 128
+    cont = bool(from_val and v > 0)  # 検証区間の開始点から (検証+予測) を1回で予測
+    mh = math.ceil((v + h if cont else max(v, h)) / 128) * 128
     use_cov = bool(csv_covs or cal_opts)
     try:
         fut_idx = future_index(d[tcol], h)
@@ -539,8 +551,13 @@ if st.button(t("start"), type="primary"):
         with st.spinner(t("predicting")):
             arrs = [d[c].to_numpy(dtype=float) for c in targets]
             args = (cov_num, cov_cat, max_context, xmode, ridge, use_xreg)
-            val_pred = run_forecast(model, arrs, n - v, v, *args)[0] if v > 0 else None
-            fut_pred, fut_q = run_forecast(model, arrs, n, h, *args)
+            if cont:
+                all_p, all_q = run_forecast(model, arrs, n - v, v + h, *args)
+                val_pred, fut_pred = all_p[:, :v], all_p[:, v:]
+                fut_q = all_q[:, v:, :] if all_q is not None else None
+            else:
+                val_pred = run_forecast(model, arrs, n - v, v, *args)[0] if v > 0 else None
+                fut_pred, fut_q = run_forecast(model, arrs, n, h, *args)
     except Exception as e:  # noqa: BLE001
         st.error(t("fail", e=e))
         st.stop()
@@ -553,7 +570,7 @@ if st.button(t("start"), type="primary"):
             metrics.append({"item": c, "MAE": np.mean(np.abs(y - p)), "RMSE": np.sqrt(np.mean((y - p) ** 2)), "MAPE(%)": mape})
     st.session_state["res"] = dict(
         targets=list(targets), v=v, val_pred=val_pred, fut_pred=fut_pred, fut_q=fut_q,
-        fut_idx=fut_idx, metrics=metrics, tcol=tcol, cov_used=list(cov_num) + list(cov_cat),
+        fut_idx=fut_idx, metrics=metrics, tcol=tcol, cont=cont, cov_used=list(cov_num) + list(cov_cat),
     )
 
 res = st.session_state.get("res")
@@ -573,6 +590,8 @@ for grp in groups:
     st.plotly_chart(make_fig(grp, targets, d, tcol, res, only, band), width="stretch")
 
 if res:
+    if res.get("cont"):
+        st.caption(t("cont_note"))
     if res.get("cov_used"):
         st.caption(t("cov_used", names=", ".join(t(n) if n.startswith("cal:") else n for n in res["cov_used"])))
     if res["metrics"]:
