@@ -50,6 +50,20 @@ TR = {
     "col_time": ("日時・時間の項目", "Date/time column"),
     "no_num": ("数値として読める項目が見つかりません（読み込んだ列: {cols}）。日時項目の選択、または区切り文字・ヘッダー行を確認してください。",
                "No column could be read as numeric (columns found: {cols}). Check the date/time column selection, the delimiter, and the header row."),
+    "series_col": ("系列名の列（ロング形式のデータ）", "Series column (long-format data)"),
+    "series_none": ("（なし：列ごとに系列）", "(none: each column is a series)"),
+    "series_help": ("「日時・系列名・値…」のように、1つの日時に系列ごとの行が並ぶ形式のときに、系列名が入っている列を選びます。"
+                    "系列ごと・予測項目ごとに、別々の時系列として予測します。",
+                    "Choose the column holding the series names when the data has one row per series for each timestamp "
+                    "(e.g. date, name, values...). Each series and each forecast column is forecast as a separate time series."),
+    "series_sel": ("予測する系列", "Series to forecast"),
+    "long_info": ("{k}系列 × {m}項目 = {s}本の時系列を予測します。", "Forecasting {s} time series ({k} series x {m} columns)."),
+    "pick_series": ("予測する系列を1つ以上選択してください。", "Please select at least one series."),
+    "dup_dates": ("日時が重複しています。1つの日時に複数行ある場合は、「系列名の列」を選択してください。",
+                  "The date/time column has duplicates. If there are several rows per timestamp, choose a series column."),
+    "no_valid": ("有効なデータがないため除外した系列: {names}", "Series excluded because they have no valid data: {names}"),
+    "val_skipped": ("検証開始時点で学習に使えるデータが32行未満のため、検証を行わない系列: {names}",
+                    "Series skipped in validation because fewer than 32 rows precede the validation start: {names}"),
     "col_targets": ("予測するデータ項目（複数選択可）", "Columns to forecast (multiple selection allowed)"),
     "val_pct": ("検証期間（データ全体に対する後半の割合 %）", "Validation period (% of the data, taken from the end)"),
     "val_pct_help": ("0にすると検証を行わず、未来予測のみ実行します", "Set to 0 to skip validation and run only the future forecast"),
@@ -207,31 +221,32 @@ def calendar_feats(ts, opts, use_jp_holiday):
 
 
 def build_design(cov_num, cov_cat, start, end, H):
-    """共変量から回帰用の説明行列を作る（数値は標準化、カテゴリはone-hot）。行数は (end-start)+H。"""
+    """1系列分の共変量から回帰用の説明行列を作る（数値は標準化、カテゴリはone-hot）。行数は (end-start)+H。"""
     L = end - start
-    cols = []
+    cols_ = []
     for v in cov_num.values():
         x = np.asarray(v[start : end + H], dtype=float)
         sd = x[:L].std()
-        cols.append((x - x[:L].mean()) / (sd if sd > 0 else 1.0))
+        cols_.append((x - x[:L].mean()) / (sd if sd > 0 else 1.0))
     for v in cov_cat.values():
         x = np.asarray(v[start : end + H])
         for cat in np.unique(x[:L])[1:]:  # 先頭カテゴリを基準にして多重共線性を避ける
-            cols.append((x == cat).astype(float))
-    return np.column_stack(cols) if cols else None
+            cols_.append((x == cat).astype(float))
+    return np.column_stack(cols_) if cols_ else None
 
 
-def ridge_forecast(model, inputs, X, H, ridge):
+def ridge_forecast(model, inputs, Xs, H, ridge):
     """JAX不要の代替: Ridge回帰で説明変数の効果を除き、残差をTimesFMで予測して効果を足し戻す。"""
-    L = len(inputs[0])
-    Xc, Xf = X[:L], X[L:]
-    A = np.column_stack([np.ones(L), Xc])
-    reg = max(float(ridge), 1e-3) * np.eye(A.shape[1])
-    reg[0, 0] = 0.0
     resid, shifts = [], []
-    for y in inputs:
-        w = np.linalg.solve(A.T @ A + reg, A.T @ np.asarray(y, dtype=float))
-        resid.append(np.asarray(y, dtype=float) - Xc @ w[1:])  # 切片は残すのでレベルは保たれる
+    for y, X in zip(inputs, Xs):
+        y = np.asarray(y, dtype=float)
+        L = len(y)
+        Xc, Xf = X[:L], X[L:]
+        A = np.column_stack([np.ones(L), Xc])
+        reg = max(float(ridge), 1e-3) * np.eye(A.shape[1])
+        reg[0, 0] = 0.0
+        w = np.linalg.solve(A.T @ A + reg, A.T @ y)
+        resid.append(y - Xc @ w[1:])  # 切片は残すのでレベルは保たれる
         shifts.append(Xf @ w[1:])
     p, q = model.forecast(horizon=H, inputs=resid)
     shifts = np.array(shifts)
@@ -240,20 +255,28 @@ def ridge_forecast(model, inputs, X, H, ridge):
     return p, q
 
 
-def run_forecast(model, arrs, end, H, cov_num, cov_cat, max_context, xmode, ridge, use_xreg=True):
-    """arrs[:, :end] を入力に H 先を予測。共変量は履歴＋未来（end+H 長）を渡す。"""
-    start = max(0, end - int(max_context))
-    inputs = [a[start:end] for a in arrs]
+def run_forecast(model, arrs, end, H, cov_num, cov_cat, max_context, xmode, ridge, use_xreg=True, los=None):
+    """各系列の arrs[i][:end] を入力に H 先を予測。
+    cov_num / cov_cat は {名前: [系列ごとの配列(履歴＋未来)]}。los は各系列の有効データ開始位置。"""
+    los = los or [0] * len(arrs)
+    starts = [max(0, end - int(max_context), lo) for lo in los]
+    inputs = [a[st:end] for a, st in zip(arrs, starts)]
     if not cov_num and not cov_cat:
         p, q = model.forecast(horizon=H, inputs=inputs)
     elif not use_xreg:
-        p, q = ridge_forecast(model, inputs, build_design(cov_num, cov_cat, start, end, H), H, ridge)
+        Xs = [build_design({k: v[i] for k, v in cov_num.items()}, {k: v[i] for k, v in cov_cat.items()}, st, end, H)
+              for i, st in enumerate(starts)]
+        p, q = ridge_forecast(model, inputs, Xs, H, ridge)
     else:
         kw = {}
         if cov_num:
-            kw["dynamic_numerical_covariates"] = {k: [v[start : end + H].tolist()] * len(arrs) for k, v in cov_num.items()}
+            kw["dynamic_numerical_covariates"] = {
+                k: [np.asarray(v[i][st : end + H], dtype=float).tolist() for i, st in enumerate(starts)]
+                for k, v in cov_num.items()}
         if cov_cat:
-            kw["dynamic_categorical_covariates"] = {k: [v[start : end + H].tolist()] * len(arrs) for k, v in cov_cat.items()}
+            kw["dynamic_categorical_covariates"] = {
+                k: [np.asarray(v[i][st : end + H]).tolist() for i, st in enumerate(starts)]
+                for k, v in cov_cat.items()}
         p, q = model.forecast_with_covariates(inputs=inputs, xreg_mode=xmode, ridge=ridge, **kw)
     q = np.asarray(q) if q is not None else None
     if q is not None and (q.ndim != 3 or q.shape[-1] < 10):
@@ -290,12 +313,17 @@ def make_fig(cols, targets, d, tcol, res, only_forecast, show_band):
         if not res:
             continue
         k = res["targets"].index(c)
-        if v > 0:
+        if v > 0 and not np.all(np.isnan(res["val_pred"][k])):
             xv = d[tcol].iloc[n - v :]
+            vq = res.get("val_q")
+            if show_band and vq is not None and np.isfinite(vq[k]).all():
+                fig.add_trace(go.Scatter(x=xv, y=vq[k][:, 9], line=dict(width=0), showlegend=False, hoverinfo="skip"))
+                fig.add_trace(go.Scatter(x=xv, y=vq[k][:, 1], line=dict(width=0), fill="tonexty",
+                                         fillcolor=rgba(color, 0.2), showlegend=False, hoverinfo="skip"))
             fig.add_trace(go.Scatter(x=xv, y=res["val_pred"][k], name=f"{c} ({t('val_fc')})",
                                      line=dict(color=color, dash="dot", width=2)))
         xf = [d[tcol].iloc[-1]] + list(res["fut_idx"])
-        y0 = res["val_pred"][k][-1] if res.get("cont") else d[c].iloc[-1]
+        y0 = res["val_pred"][k][-1] if (res.get("cont") and v > 0 and np.isfinite(res["val_pred"][k][-1])) else d[c].iloc[-1]
         yf = [y0] + list(res["fut_pred"][k])
         if show_band and res["fut_q"] is not None:
             lo, hi = res["fut_q"][k][:, 1], res["fut_q"][k][:, 9]
@@ -338,7 +366,7 @@ SPEC = {
     "xmode": ("choice", XMODES[0], XMODES),
     "ridge": ("float", 0.0, (0.0, 1000.0)),
 }
-CFG_KEYS = ["tcol", "targets", "csv_covs"] + list(SPEC)
+CFG_KEYS = ["tcol", "series_col", "series_sel", "targets", "csv_covs"] + list(SPEC)
 
 
 def coerce(key, v):
@@ -389,21 +417,52 @@ if "engine_init" not in ss:
     ss["engine_init"] = True
 
 
+def detect_series_col(tc):
+    """同じ日時に複数行あり、(日時, 列) が一意になる文字列列を系列名の列とみなす。"""
+    if not df[tc].duplicated().any():
+        return ""
+    for c in cols:
+        if c != tc and not pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() <= 200 \
+                and not df.duplicated([tc, c]).any():
+            return c
+    return ""
+
+
+def series_values(sc):
+    return sorted(df[sc].dropna().astype(str).unique()) if sc else []
+
+
 def sync_state():
-    """列に依存する選択（日時・予測項目・説明変数）を、現在のCSVで有効な値に整える。"""
+    """列に依存する選択（日時・系列・予測項目・説明変数）を、現在のCSVで有効な値に整える。"""
     if ss.get("tcol") not in cols:
         ss["tcol"] = cols[guess_time_col(df)]
-    nc = [c for c in cols if c != ss["tcol"] and to_num(df[c]).notna().mean() > 0.5]
+    sc = ss.get("series_col")
+    if sc is None or (sc and sc not in cols):
+        sc = detect_series_col(ss["tcol"])
+    ss["series_col"] = "" if sc == ss["tcol"] else sc
+    sc = ss["series_col"]
+    vals = series_values(sc)
+    cur_s = ss.get("series_sel")
+    valid_s = [x for x in (cur_s or []) if x in vals]
+    ss["series_sel"] = (vals[:10] if (cur_s is None or (cur_s and not valid_s) or not cur_s and sc and "_sel_init" not in ss)
+                        else valid_s) if sc else []
+    if sc:
+        ss["_sel_init"] = True
+    nc = [c for c in cols if c not in (ss["tcol"], sc) and to_num(df[c]).notna().mean() > 0.5]
     cur = ss.get("targets")
     valid = [c for c in (cur or []) if c in nc]
     ss["targets"] = nc[:1] if (cur is None or (cur and not valid)) else valid
-    ss["csv_covs"] = [c for c in ss.get("csv_covs", []) if c in cols and c != ss["tcol"] and c not in ss["targets"]]
+    ss["csv_covs"] = [c for c in ss.get("csv_covs", []) if c in cols and c not in (ss["tcol"], sc) and c not in ss["targets"]]
     return nc
 
 
 def apply_cfg(cfg):
     if cfg.get("tcol") in cols:
         ss["tcol"] = cfg["tcol"]
+    if cfg.get("series_col") in cols or cfg.get("series_col") == "":
+        ss["series_col"] = cfg["series_col"]
+    if isinstance(cfg.get("series_sel"), list):
+        ss["series_sel"] = [str(x) for x in cfg["series_sel"]]
     for k in SPEC:
         if k in cfg:
             v = coerce(k, cfg[k])
@@ -453,9 +512,18 @@ with st.expander(t("preview"), expanded=False):
 
 c1, c2 = st.columns(2)
 tcol = c1.selectbox(t("col_time"), cols, key="tcol")
+series_col = c2.selectbox(t("series_col"), [""] + [c for c in cols if c != tcol], key="series_col",
+                          format_func=lambda x: t("series_none") if x == "" else x, help=t("series_help"))
 if not num_cols:
     st.warning(t("no_num", cols=cols))
-targets = c2.multiselect(t("col_targets"), num_cols, key="targets")
+c5, c6 = st.columns(2)
+targets = c5.multiselect(t("col_targets"), num_cols, key="targets")
+if series_col:
+    series_sel = c6.multiselect(t("series_sel"), series_values(series_col), key="series_sel")
+else:
+    series_sel = []
+    if df[tcol].duplicated().any():
+        c6.warning(t("dup_dates"))
 
 c3, c4 = st.columns(2)
 val_pct = c3.slider(t("val_pct"), 0, 50, key="val_pct", help=t("val_pct_help"))
@@ -475,7 +543,7 @@ with st.expander(t("params_exp")):
 with st.expander(t("cov_exp"), expanded=False):
     csv_covs = st.multiselect(
         t("csv_covs"),
-        [c for c in cols if c != tcol and c not in targets],
+        [c for c in cols if c not in (tcol, series_col) and c not in targets],
         key="csv_covs",
         help=t("csv_covs_help"),
     )
@@ -497,26 +565,75 @@ with st.expander(t("cov_exp"), expanded=False):
 if not targets:
     st.warning(t("pick_target"))
     st.stop()
+if series_col and not series_sel:
+    st.warning(t("pick_series"))
+    st.stop()
 
 # ---------------------------------------------------------------- data prep
-d_all = df[[tcol] + targets + csv_covs].copy()
-d_all[tcol] = pd.to_datetime(d_all[tcol], errors="coerce")
-d_all = d_all.dropna(subset=[tcol]).sort_values(tcol).reset_index(drop=True)
-for c in targets:
-    d_all[c] = to_num(d_all[c])
-empty_tail = d_all[targets].isna().all(axis=1).to_numpy()
-nf = 0  # CSV末尾の「予測項目が空欄の行」数（＝未来の説明変数が入っている行）
+value_cols = list(targets) + list(csv_covs)
+if series_col:
+    # ロング形式: (日時, 系列) ごとに1行 → 系列ごと・項目ごとの列（ワイド形式）へ変換
+    L = df[[tcol, series_col] + value_cols].copy()
+    L[tcol] = pd.to_datetime(L[tcol], errors="coerce")
+    L[series_col] = L[series_col].astype(str)
+    L = L.dropna(subset=[tcol])
+    L = L[L[series_col].isin(series_sel)]
+    for c in value_cols:
+        if c in targets or to_num(L[c]).notna().mean() > 0.9:
+            L[c] = to_num(L[c])
+    dates = pd.DatetimeIndex(sorted(L[tcol].unique()))
+    d_all = pd.DataFrame(index=dates)
+    names, cov_map = [], []
+    for c in targets:
+        wide = L.groupby([tcol, series_col])[c].last().unstack(series_col)
+        for sy in series_sel:
+            nm = sy if len(targets) == 1 else f"{sy} | {c}"
+            d_all[nm] = wide[sy] if sy in wide.columns else np.nan
+            names.append(nm)
+            cov_map.append({cv: f"{cv} <{sy}>" for cv in csv_covs})
+    for cv in csv_covs:
+        wide = L.groupby([tcol, series_col])[cv].last().unstack(series_col)
+        for sy in series_sel:
+            d_all[f"{cv} <{sy}>"] = wide[sy] if sy in wide.columns else np.nan
+    d_all = d_all.rename_axis(tcol).reset_index()
+else:
+    d_all = df[[tcol] + value_cols].copy()
+    d_all[tcol] = pd.to_datetime(d_all[tcol], errors="coerce")
+    d_all = d_all.dropna(subset=[tcol]).sort_values(tcol).reset_index(drop=True)
+    for c in targets:
+        d_all[c] = to_num(d_all[c])
+    names = list(targets)
+    cov_map = [{cv: cv for cv in csv_covs} for _ in names]
+
+empty_tail = d_all[names].isna().all(axis=1).to_numpy()
+nf = 0  # 末尾の「予測項目が空欄の行」数（＝未来の説明変数が入っている行）
 while nf < len(d_all) and empty_tail[len(d_all) - 1 - nf]:
     nf += 1
 fut_rows = d_all.iloc[len(d_all) - nf :]
-d = d_all.iloc[: len(d_all) - nf].copy()
-for c in targets:
-    d[c] = d[c].interpolate(limit_direction="both")
-d = d.dropna(subset=targets).reset_index(drop=True)
+d = d_all.iloc[: len(d_all) - nf].copy().reset_index(drop=True)
+los, keep = [], []
+for i, c in enumerate(names):
+    first = d[c].first_valid_index()
+    if first is None:
+        continue
+    keep.append(i)
+    if series_col:  # 系列ごとに開始時期が違うため、先頭の欠損は補完せず開始位置を記録
+        d[c] = d[c].interpolate(limit_area="inside").ffill()
+        los.append(int(first))
+    else:
+        d[c] = d[c].interpolate(limit_direction="both")
+        los.append(0)
+if len(keep) < len(names):
+    st.info(t("no_valid", names=", ".join(names[i] for i in range(len(names)) if i not in keep)))
+names = [names[i] for i in keep]
+cov_map = [cov_map[i] for i in keep]
 n = len(d)
-if n < 40:
+if not names or n < 40:
     st.error(t("few_rows"))
     st.stop()
+if series_col:
+    st.caption(t("long_info", k=len(series_sel), m=len(targets), s=len(names)))
+targets = names  # 以降は「系列」の名前リスト（ロング形式なら 系列 x 項目）
 
 # ---------------------------------------------------------------- forecast
 if st.button(t("start"), type="primary"):
@@ -536,37 +653,80 @@ if st.button(t("start"), type="primary"):
         with st.spinner(t("model_loading")):
             model = get_model(int(max_context), mh, normalize, qhead, flip, positive, fixq, use_cov and eff_xreg)
         timeline = pd.DatetimeIndex(list(d[tcol]) + list(fut_idx))
-        cov_num, cov_cat = {}, {}
-        for c in csv_covs:
-            full = pd.concat([d[c], fut_rows[c]], ignore_index=True)
+        S = len(targets)
+        cov_num, cov_cat, cache = {}, {}, {}
+
+        def prep_cov(col):
+            full = pd.concat([d[col], fut_rows[col]], ignore_index=True)
             if to_num(full).notna().mean() > 0.9:
-                s = to_num(full).interpolate(limit_direction="both").reset_index(drop=True)
-                if fill_mode == "forecast" and len(s) < n + h:
-                    ctx = s.to_numpy(dtype=float)[-int(max_context) :]
-                    miss = n + h - len(s)
+                x = to_num(full).interpolate(limit_direction="both").reset_index(drop=True)
+                if fill_mode == "forecast" and len(x) < n + h:
+                    ctx = x.to_numpy(dtype=float)[-int(max_context) :]
+                    miss = n + h - len(x)
                     pf = np.asarray(model.forecast(horizon=miss, inputs=[ctx])[0][0])[-miss:]  # backcast付きの場合に備え末尾のみ
-                    s = pd.concat([s, pd.Series(pf)], ignore_index=True)
-                s = s.reindex(range(n + h)).ffill()
-                cov_num[c] = s.to_numpy(dtype=float)
-            else:
-                cov_cat[c] = full.astype(str).reindex(range(n + h)).ffill().to_numpy()
+                    x = pd.concat([x, pd.Series(pf)], ignore_index=True)
+                return "num", x.reindex(range(n + h)).ffill().to_numpy(dtype=float)
+            return "cat", full.astype(str).reindex(range(n + h)).ffill().to_numpy()
+
+        for cv in csv_covs:
+            per, kind = [], "num"
+            for i in range(S):
+                col = cov_map[i][cv]
+                if col not in cache:
+                    cache[col] = prep_cov(col)
+                kind, arr = cache[col]
+                per.append(arr)
+            (cov_num if kind == "num" else cov_cat)[cv] = per
         if csv_covs and nf < h:
             st.warning(t("warn_fill_forecast" if fill_mode == "forecast" else "warn_fill_last", nf=nf))
         cal = calendar_feats(timeline, cal_opts, jp_hol)
-        dropped = [k for k, a in cal.items() if len(np.unique(a)) <= 1]
-        cov_cat.update({k: a for k, a in cal.items() if k not in dropped})
+        dropped = [k for k, a_ in cal.items() if len(np.unique(a_)) <= 1]
+        for k, a_ in cal.items():
+            if k not in dropped:
+                cov_cat[k] = [a_] * S
         if dropped:
             st.info(t("dropped", names=", ".join(t(k) for k in dropped)))
+
+        def pick(cov, idx):
+            return {k: [vv[i] for i in idx] for k, vv in cov.items()}
+
         with st.spinner(t("predicting")):
             arrs = [d[c].to_numpy(dtype=float) for c in targets]
-            args = (cov_num, cov_cat, max_context, xmode, ridge, eff_xreg)
-            if cont:
-                all_p, all_q = run_forecast(model, arrs, n - v, v + h, *args)
-                val_pred, fut_pred = all_p[:, :v], all_p[:, v:]
-                fut_q = all_q[:, v:, :] if all_q is not None else None
-            else:
-                val_pred = run_forecast(model, arrs, n - v, v, *args)[0] if v > 0 else None
-                fut_pred, fut_q = run_forecast(model, arrs, n, h, *args)
+
+            def call(idx, end, H):
+                return run_forecast(model, [arrs[i] for i in idx], end, H, pick(cov_num, idx), pick(cov_cat, idx),
+                                    max_context, xmode, ridge, eff_xreg, [los[i] for i in idx])
+
+            # 検証開始時点で学習データが32行以上ある系列だけ検証する（系列ごとに開始時期が違う場合に備える）
+            idx_ok = [i for i in range(S) if v > 0 and n - v - los[i] >= 32]
+            if v > 0 and len(idx_ok) < S:
+                st.warning(t("val_skipped", names=", ".join(targets[i] for i in range(S) if i not in idx_ok)))
+            val_pred = np.full((S, v), np.nan)
+            fut_pred = np.zeros((S, h))
+            fut_q = np.full((S, h, 10), np.nan)
+            val_q = np.full((S, v, 10), np.nan)
+            if idx_ok:
+                if cont:
+                    p, q = call(idx_ok, n - v, v + h)
+                    val_pred[idx_ok], fut_pred[idx_ok] = p[:, :v], p[:, v:]
+                    if q is not None:
+                        fut_q[idx_ok] = q[:, v:, :]
+                        val_q[idx_ok] = q[:, :v, :]
+                else:
+                    p, q = call(idx_ok, n - v, v)
+                    val_pred[idx_ok] = p
+                    if q is not None:
+                        val_q[idx_ok] = q
+            idx_fut = [i for i in range(S) if i not in idx_ok] if cont else list(range(S))
+            if idx_fut:
+                p, q = call(idx_fut, n, h)
+                fut_pred[idx_fut] = p
+                if q is not None:
+                    fut_q[idx_fut] = q
+            if np.isnan(fut_q).any():
+                fut_q = None
+            if v == 0 or not idx_ok or not np.isfinite(val_q[idx_ok]).all():
+                val_q = None
     except Exception as e:  # noqa: BLE001
         st.error(t("fail", e=e))
         st.stop()
@@ -574,11 +734,13 @@ if st.button(t("start"), type="primary"):
     metrics = []
     if v > 0:
         for k, c in enumerate(targets):
+            if np.isnan(val_pred[k]).all():
+                continue
             y, p = arrs[k][n - v :], val_pred[k]
             mape = float(np.mean(np.abs((y - p)[y != 0] / y[y != 0])) * 100) if np.any(y != 0) else np.nan
             metrics.append({"item": c, "MAE": np.mean(np.abs(y - p)), "RMSE": np.sqrt(np.mean((y - p) ** 2)), "MAPE(%)": mape})
     st.session_state["res"] = dict(
-        targets=list(targets), v=v, val_pred=val_pred, fut_pred=fut_pred, fut_q=fut_q,
+        targets=list(targets), v=v, val_pred=val_pred, fut_pred=fut_pred, fut_q=fut_q, val_q=val_q,
         fut_idx=fut_idx, metrics=metrics, tcol=tcol, cont=cont, cov_used=list(cov_num) + list(cov_cat),
     )
 
@@ -591,7 +753,7 @@ st.subheader(t("graph"))
 g1, g2, g3 = st.columns([2, 1, 1])
 view = g1.radio(t("view"), ["full", "only"], horizontal=True, disabled=res is None, format_func=lambda x: t("view_" + x))
 split = g2.checkbox(t("split"), False)
-band = g3.checkbox(t("band"), False, disabled=res is None or res["fut_q"] is None)
+band = g3.checkbox(t("band"), False, disabled=res is None or (res["fut_q"] is None and res.get("val_q") is None))
 only = view == "only"
 
 groups = [[c] for c in targets] if split else [targets]
