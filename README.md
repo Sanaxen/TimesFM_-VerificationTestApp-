@@ -34,9 +34,19 @@ The UI is built with Streamlit, so you can go from loading a CSV to forecasting 
 
 1. **Select a CSV.** The encoding (UTF-8 / Shift-JIS) and delimiter (comma, semicolon, tab) are detected automatically.
 2. Choose the **date/time column** and the **columns to forecast** (multiple selection is supported).
+   - For **long-format** data with one row per series for each timestamp (e.g. `date, name, value1, value2...`), also choose the **series column**. If the date/time column has duplicates, a series column is chosen automatically.
 3. Set the **validation period** (what percentage of the data, taken from the end, is used for validation) and the **forecast horizon** (number of rows to forecast beyond the end of the data).
 4. If needed, set the **TimesFM parameters** and **covariates** (defaults are used at startup).
 5. Click **Start forecast** to add the results to the chart.
+
+### Long-format data (with a series column)
+
+When you choose a series column, each series and each forecast column is forecast as a separate time series (for example, 7 series x 1 column = 7 series).
+
+- Series that start at different times are supported. The period before a series begins is not filled in.
+- A series with fewer than 32 rows before the validation start is skipped in validation and only gets the future forecast.
+- CSV covariates use the values of **the same series** (for example, that series' rainfall). Covariates generated from the date/time (such as day of week) are shared by all series.
+- The first 10 series are selected by default. If there are many, select only the ones you need.
 
 ### How validation and forecasting work
 
@@ -57,7 +67,7 @@ These are two separate forecasts, so there can be a step between the end of the 
 - Each forecast column is drawn in its own color. The validation period is shaded orange and the future forecast period green.
 - The view toggle switches between the full view and "Validation and forecast periods only".
 - "Separate chart per column" shows columns with different scales in separate charts.
-- "Show prediction interval (10-90%)" draws the forecast range as a band (not available with some covariate methods).
+- "Show prediction interval (10-90%)" draws the forecast range as a band, for **both the validation forecast and the future forecast** (not available with some covariate methods).
 - The future forecast can be downloaded as a CSV.
 
 ## TimesFM parameters
